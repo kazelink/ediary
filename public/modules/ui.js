@@ -1,6 +1,5 @@
 import { Utils, State, RI_SVGS, loadScript } from './dom.js';
 
-let _authFocusTimer = null;
 
 const AUTH_ARROW_SVG = '<svg viewBox="0 0 24 24"><path d="M16.172 11l-5.364-5.364 1.414-1.414L20 12l-7.778 7.778-1.414-1.414L16.172 13H4v-2z"></path></svg>';
 
@@ -106,22 +105,19 @@ export const UI = {
         const inputEl = Utils.$('auth-input');
         if (inputEl) {
             inputEl.value = '';
-            if (_authFocusTimer) clearTimeout(_authFocusTimer);
-            _authFocusTimer = setTimeout(() => {
-                _authFocusTimer = null;
-                if (overlay.classList.contains('active')) inputEl.focus({ preventScroll: true });
-            }, 300);
+            // Native event-driven focus when transition completes
+            const focusOnReady = (e) => {
+                if (e.propertyName === 'opacity') {
+                    inputEl.focus({ preventScroll: true });
+                }
+            };
+            overlay.addEventListener('transitionend', focusOnReady, { once: true });
         }
     },
 
     hideAuth() {
         const overlay = Utils.$('auth-overlay');
         if (overlay) overlay.classList.remove('active');
-        
-        if (_authFocusTimer) {
-            clearTimeout(_authFocusTimer);
-            _authFocusTimer = null;
-        }
     },
 
     initGlobalEvents() {

@@ -30,7 +30,7 @@
         <div class="auth-card">
             <div class="c-title">ENTER PASSWORD</div>
             <form id="auth-form" hx-post="/api/login" hx-target="#auth-messages" hx-swap="innerHTML">
-                <input type="password" name="password" id="auth-input" required placeholder="">
+                <input type="password" name="password" id="auth-input" required placeholder="" autofocus>
                 <button type="submit" class="auth-btn">
                     <svg viewBox="0 0 24 24">
                         <path d="M16.172 11l-5.364-5.364 1.414-1.414L20 12l-7.778 7.778-1.414-1.414L16.172 13H4v-2z">
