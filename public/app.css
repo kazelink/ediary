@@ -993,13 +993,13 @@ input[type=number] {
 }
 
 .tb-more-wrapper:hover .tb-more-panel,
-.tb-more-wrapper.open .tb-more-panel {
+.tb-more-wrapper.active .tb-more-panel {
     display: block;
     animation: moreSlide 0.18s ease-out;
 }
 
 .tb-more-wrapper:hover .tb-more-trigger,
-.tb-more-wrapper.open .tb-more-trigger {
+.tb-more-wrapper.active .tb-more-trigger {
     background: var(--m-blu-light);
     color: var(--m-blu);
 }

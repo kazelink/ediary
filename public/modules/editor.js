@@ -310,12 +310,15 @@ export const Editor = {
             const positionPanel = () => {
                 morePanel.style.left = '100%';
                 morePanel.style.right = 'auto';
-                const rect = morePanel.getBoundingClientRect();
-                if (rect.right > window.innerWidth) {
-                    morePanel.style.left = 'auto';
-                    morePanel.style.right = '100%';
-                }
+                requestAnimationFrame(() => {
+                    const rect = morePanel.getBoundingClientRect();
+                    if (rect.right > window.innerWidth - 10) {
+                        morePanel.style.left = 'auto';
+                        morePanel.style.right = '100%';
+                    }
+                });
             };
+            moreWrapper.addEventListener('mouseenter', positionPanel);
             moreTrigger.onmousedown = (e) => {
                 e.preventDefault();
                 const isActive = moreWrapper.classList.contains('active');
