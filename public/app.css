@@ -31,6 +31,7 @@
     --danger: #ef4444;
     --success: #10b981;
     --fold-height: 380px;
+    --card-pad: 28px;
 }
 
 * {
@@ -393,9 +394,9 @@ input[type=number] {
     border-top: none;
     border-radius: 0 0 var(--rad) var(--rad);
     background: var(--card-bg);
-    margin-left: -28px;
-    margin-right: -28px;
-    width: calc(100% + 56px);
+    margin-left: calc(-1 * var(--card-pad));
+    margin-right: calc(-1 * var(--card-pad));
+    width: calc(100% + (2 * var(--card-pad)));
 }
 
 .editor-in-new {
@@ -1216,7 +1217,7 @@ input[type=number] {
 .d-item {
     display: flex;
     flex-direction: column;
-    padding: 28px;
+    padding: var(--card-pad);
     margin-bottom: 24px;
     background: var(--card-bg);
     border-radius: var(--rad);
@@ -1649,6 +1650,9 @@ input[type=number] {
    11. Responsive
    ========================================================================== */
 @media (max-width:600px) {
+    :root {
+        --card-pad: 14px;
+    }
     body {
         padding: 4px 4px 0;
     }
@@ -1658,7 +1662,7 @@ input[type=number] {
     }
 
     .d-item {
-        padding: 16px 14px;
+        padding: 16px var(--card-pad);
         margin-bottom: 12px;
         border-radius: 12px;
     }
