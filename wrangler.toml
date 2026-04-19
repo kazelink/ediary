@@ -1,0 +1,25 @@
+name        = "ediary"
+main        = "src/index.js"
+compatibility_date = "2025-12-01"
+
+[[d1_databases]]
+binding      = "DB"
+
+[[r2_buckets]]
+binding     = "IMG_BUCKET"
+
+[assets]
+directory = "./public"
+
+[[rules]]
+type = "Text"
+globs = ["**/*.css"]
+fallthrough = true
+
+[[rules]]
+type = "Data"
+globs = ["**/*.woff2"]
+fallthrough = true
+
+[triggers]
+crons = ["0 3 * * SUN"]

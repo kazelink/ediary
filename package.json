@@ -1,0 +1,16 @@
+{
+  "name": "ediary",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "node scripts/deploy-build.mjs"
+  },
+  "dependencies": {
+    "hono": "^4.4.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4.45.0"
+  }
+}
