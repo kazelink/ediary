@@ -1301,7 +1301,7 @@ input[type=number] {
 
 /* Read More */
 .btn-read-more {
-    display: flex;
+    display: none;
     justify-content: center;
     margin-top: 10px;
     position: relative;

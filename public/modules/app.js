@@ -402,11 +402,13 @@ const App = {
 
         // Remove the fold UI when the rendered content is already short enough.
         document.addEventListener('htmx:afterSettle', (e) => {
-            const items = (e.target || document).querySelectorAll('.content-folded');
+            const items = (e.target || document).querySelectorAll('.dc-text');
             items.forEach(el => {
-                if (el.scrollHeight <= el.clientHeight) {
+                const btn = el.nextElementSibling;
+                if (el.scrollHeight > el.clientHeight) {
+                    if (btn?.classList.contains('btn-read-more')) btn.style.display = 'flex';
+                } else {
                     el.classList.remove('content-folded');
-                    const btn = el.nextElementSibling;
                     if (btn?.classList.contains('btn-read-more')) btn.style.display = 'none';
                 }
             });
