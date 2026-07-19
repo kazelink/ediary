@@ -4,6 +4,7 @@ const RETRY_DELAYS_MS = [0, 250, 750, 1500];
 const REQUIRED_TABLES = ['diaries', 'diary_stats', 'diary_media'];
 const REQUIRED_TRIGGERS = ['t_insert_diary', 't_delete_diary', 't_update_diary'];
 const MEDIA_BACKFILL_PAGE_SIZE = 100;
+const MEDIA_BACKFILL_BATCH_STATEMENTS = 100;
 
 const SCHEMA_STATEMENTS = [
   `
@@ -117,15 +118,30 @@ async function applySchema(db) {
     }
   }
 
-  await backfillDiaryMedia(db);
+  // Best-effort backfill: never let it fail or stall the schema (and with it
+  // every data request). The weekly cron rebuilds the full index anyway; until
+  // then media cleanup simply behaves like the pre-index version for any
+  // entries the backfill did not reach.
+  try {
+    await backfillDiaryMedia(db);
+  } catch (error) {
+    console.error('diary_media backfill skipped (cron will rebuild):', error);
+  }
 }
 
-// Backfill: populate diary_media from existing content so index-aware media
-// cleanup sees references created before this table existed. Runs only inside
-// applySchema (i.e. on migration/repair), is idempotent via INSERT OR IGNORE,
-// and paginates by rowid to keep memory bounded on large databases.
+// Populate diary_media from existing content so index-aware media cleanup sees
+// references created before this table existed. Idempotent via INSERT OR
+// IGNORE; paginated by rowid to keep memory bounded on large databases.
 async function backfillDiaryMedia(db) {
   let lastRowId = 0;
+  let statements = [];
+
+  const flushStatements = async () => {
+    if (!statements.length) return;
+    await db.batch(statements);
+    statements = [];
+  };
+
   while (true) {
     const { results } = await db.prepare(
       'SELECT rowid, id, content FROM diaries WHERE rowid > ? ORDER BY rowid LIMIT ?'
@@ -135,18 +151,19 @@ async function backfillDiaryMedia(db) {
     if (!rows.length) break;
     lastRowId = rows[rows.length - 1].rowid;
 
-    const statements = [];
     for (const row of rows) {
       for (const key of extractMediaKeys(row.content)) {
         statements.push(
           db.prepare('INSERT OR IGNORE INTO diary_media (diary_id, media_key) VALUES (?, ?)').bind(row.id, key)
         );
       }
+      if (statements.length >= MEDIA_BACKFILL_BATCH_STATEMENTS) await flushStatements();
     }
-    if (statements.length) await db.batch(statements);
 
     if (rows.length < MEDIA_BACKFILL_PAGE_SIZE) break;
   }
+
+  await flushStatements();
 }
 
 export async function ensureSchema(env) {

@@ -494,6 +494,14 @@ const App = {
             }
         });
 
+        // Network-level failures never produce a response, so without this the
+        // loading spinner would spin forever.
+        ['htmx:sendError', 'htmx:timeout'].forEach((name) => {
+            document.addEventListener(name, (e) => {
+                if (e.target?.id !== 'auth-form') UI.setStatus('err');
+            });
+        });
+
         document.addEventListener('change', async (e) => {
             const input = e.target;
             if (!input || input.id !== 'restore-input') return;
