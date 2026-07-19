@@ -2,9 +2,16 @@ import { loadScript } from './dom.js';
 
 const SWAL_SRC = '/assets/sweetalert2.all.min.js';
 
+// The library is normally already present via the deferred <script> in
+// app.html; the lazy load is a fallback, not the primary path.
+function ensureSwal() {
+    if (typeof Swal !== 'undefined') return Promise.resolve();
+    return loadScript(SWAL_SRC);
+}
+
 export async function swalAlert(title, text, icon = 'info') {
     try {
-        await loadScript(SWAL_SRC);
+        await ensureSwal();
         return Swal.fire({ title, text: text || '', icon, scrollbarPadding: false });
     } catch (e) {
         console.error(e);
@@ -15,7 +22,7 @@ export async function swalAlert(title, text, icon = 'info') {
 
 export async function swalConfirm(title, text) {
     try {
-        await loadScript(SWAL_SRC);
+        await ensureSwal();
         const result = await Swal.fire({
             title,
             text: text || '',
@@ -34,7 +41,7 @@ export async function swalConfirm(title, text) {
 
 export async function swalUnsaved(saveCallback) {
     try {
-        await loadScript(SWAL_SRC);
+        await ensureSwal();
         const result = await Swal.fire({
             title: 'Unsaved Changes',
             icon: 'warning',

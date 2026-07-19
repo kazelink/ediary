@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { authMiddleware } from '../lib/auth.js';
 import { jsonError, parseJsonBody } from '../lib/http.js';
 import { sanitizeContent } from '../lib/sanitize.js';
-import { cleanupImages } from '../lib/utils.js';
+import { cleanupImages, diaryMediaStatements } from '../lib/utils.js';
 import { V } from '../lib/validate.js';
 import { UPSERT_DIARY_SQL } from '../lib/sql.js';
 
@@ -60,7 +60,7 @@ async function promoteTempMedia(bucket, content) {
 
 function parseAndValidateRequest(body) {
   const { id: clientId, date, content } = body;
-  
+
   if (clientId && !V.isUUID(clientId)) throw new Error('Invalid client ID format');
   if (!V.isDateStr(date)) throw new Error('Invalid date format');
   if (!V.isNonEmpty(content)) throw new Error('Content required');
@@ -95,7 +95,10 @@ router.post('/', authMiddleware, async (c) => {
       return jsonError(c, e.message, e.message.includes('missing') ? 409 : 500);
     }
 
-    await c.env.DB.prepare(UPSERT_DIARY_SQL).bind(id, date, sanitizedContent).run();
+    await c.env.DB.batch([
+      c.env.DB.prepare(UPSERT_DIARY_SQL).bind(id, date, sanitizedContent),
+      ...diaryMediaStatements(c.env.DB, id, sanitizedContent)
+    ]);
 
     if (promotedKeys.length > 0) {
       const uniqueTmpKeys = [...new Set(promotedKeys)];
@@ -106,7 +109,7 @@ router.post('/', authMiddleware, async (c) => {
 
     if (previousContent) {
       c.executionCtx.waitUntil(
-        cleanupImages(c.env.IMG_BUCKET, previousContent, sanitizedContent).catch(e => {
+        cleanupImages(c.env.IMG_BUCKET, previousContent, sanitizedContent, c.env.DB).catch(e => {
           console.error('Image cleanup failed after save:', e);
         })
       );

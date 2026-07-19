@@ -1,5 +1,6 @@
 import { Utils, RI_SVGS } from './dom.js';
 import { UI } from './ui.js';
+import { Nonce, Token } from './api.js';
 
 export const Auth = {
     init() {
@@ -51,10 +52,12 @@ export const Auth = {
             }
         });
 
-        // Handle login success via HX-Trigger from backend
-        document.body.addEventListener('loginSuccess', async (e) => {
-            const nonce = e.detail?.nonce;
-            if (nonce) sessionStorage.setItem('session_nonce', nonce);
+        // Server returns nonce + JWT as data-* attributes on the swapped <div class="auth-ok">.
+        // Trigger fires after swap (HX-Trigger-After-Swap), so the element is already in the DOM.
+        document.body.addEventListener('loginSuccess', async () => {
+            const okEl = Utils.$('auth-messages')?.querySelector('.auth-ok');
+            if (okEl?.dataset?.nonce) Nonce.set(okEl.dataset.nonce);
+            if (okEl?.dataset?.token) Token.set(okEl.dataset.token);
             if (authBtn) {
                 authBtn.innerHTML = '<i class="ri-check-line" style="font-size:24px"></i>';
                 authBtn.style.background = 'var(--success)';

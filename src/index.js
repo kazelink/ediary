@@ -3,9 +3,8 @@ import { scheduledBackup } from './lib/scheduled.js';
 import { ensureSchema } from './lib/schema.js';
 import { escapeHtml, respondError } from './lib/utils.js';
 
-import imagesRouter from './api/images.js';
+import { createImagesRouter } from './api/images.js';
 import loginRouter from './api/login.js';
-import authStatusRouter from './api/auth-status.js';
 import statsRouter from './api/stats.js';
 import monthsRouter from './api/months.js';
 import listRouter from './api/list.js';
@@ -30,6 +29,10 @@ app.use('/api/*', async (c, next) => {
         await ensureSchema(c.env);
     }
     await next();
+    // API responses are dynamic and authenticated — never cacheable.
+    if (!c.res.headers.has('Cache-Control')) {
+        c.res.headers.set('Cache-Control', 'no-store');
+    }
 });
 
 app.onError((error, c) => {
@@ -47,11 +50,10 @@ app.get('/', (c) => c.redirect('/app.html'));
 app.get('/index.html', (c) => c.redirect('/app.html'));
 app.get('/backup', (c) => c.redirect('/app.html?view=backup'));
 
-app.route('/img', imagesRouter);
-app.route('/video', imagesRouter);
+app.route('/img', createImagesRouter('img'));
+app.route('/video', createImagesRouter('video'));
 
 app.route('/api/login', loginRouter);
-app.route('/api/auth-status', authStatusRouter);
 app.route('/api/stats', statsRouter);
 app.route('/api/months', monthsRouter);
 app.route('/api/list', listRouter);

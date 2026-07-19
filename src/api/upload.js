@@ -53,13 +53,10 @@ function detectMediaMime(bytes) {
   return '';
 }
 
-function validateUploadRequest(c, contentLength, requestType) {
+function validateUploadRequest(c, contentLength) {
   if (!c.env.IMG_BUCKET) throw new Error('Storage not configured');
   if (contentLength != null && contentLength > MAX_UPLOAD) {
     throw Object.assign(new Error('File too large (max 100MB)'), { status: 413 });
-  }
-  if (!requestType.includes('multipart/form-data')) {
-    throw new Error('multipart/form-data required');
   }
 }
 
@@ -72,18 +69,105 @@ async function validateFileContents(file) {
 
   const headerBytes = new Uint8Array(await file.slice(0, 32).arrayBuffer());
   const detectedType = detectMediaMime(headerBytes);
-  
+
   if (!detectedType || !ALLOWED_MIME.has(detectedType)) throw new Error('Invalid file');
   if (detectedType !== declaredType) throw new Error('MIME type mismatch');
 
   return detectedType;
 }
 
+// Validate magic bytes and enforce the size cap while the body streams through,
+// so raw uploads never have to be buffered in isolate memory.
+function createUploadValidationStream(declaredType) {
+  let headerBytes = new Uint8Array(0);
+  let totalBytes = 0;
+  let headerChecked = false;
+
+  const validateHeader = () => {
+    const detectedType = detectMediaMime(headerBytes);
+    if (!detectedType || !ALLOWED_MIME.has(detectedType)) throw new Error('Invalid file');
+    if (detectedType !== declaredType) throw new Error('MIME type mismatch');
+  };
+
+  return new TransformStream({
+    transform(chunk, controller) {
+      totalBytes += chunk.byteLength;
+      if (totalBytes > MAX_UPLOAD) {
+        throw Object.assign(new Error('File too large (max 100MB)'), { status: 413 });
+      }
+
+      if (!headerChecked) {
+        const need = 32 - headerBytes.length;
+        if (need > 0) {
+          const take = chunk.subarray(0, need);
+          const merged = new Uint8Array(headerBytes.length + take.length);
+          merged.set(headerBytes);
+          merged.set(take, headerBytes.length);
+          headerBytes = merged;
+        }
+        if (headerBytes.length >= 32) {
+          validateHeader();
+          headerChecked = true;
+        }
+      }
+
+      controller.enqueue(chunk);
+    },
+    flush() {
+      if (totalBytes === 0) throw new Error('File required');
+      if (!headerChecked) validateHeader();
+    }
+  });
+}
+
+function mediaUrl(filename, mime) {
+  const routeBase = mime.startsWith('video/') ? 'video' : 'img';
+  return `/${routeBase}/${filename}`;
+}
+
+// Raw-body upload: the client sends the file bytes directly with its MIME type
+// as Content-Type. The body is piped to R2 through the validation stream — the
+// file never sits fully in memory, unlike multipart parsing.
+async function handleRawUpload(c, declaredType, contentLength) {
+  if (!c.req.raw.body) throw new Error('File required');
+  // R2 streaming writes need a known length; browser XHR/fetch always sets it.
+  if (contentLength == null) {
+    throw Object.assign(new Error('Content-Length required'), { status: 411 });
+  }
+
+  const ext = MIME_EXT[declaredType];
+  const filename = `tmp/${crypto.randomUUID()}.${ext}`;
+
+  const fixed = new FixedLengthStream(contentLength);
+  const pipePromise = c.req.raw.body
+    .pipeThrough(createUploadValidationStream(declaredType))
+    .pipeTo(fixed.writable);
+  const putPromise = c.env.IMG_BUCKET.put(filename, fixed.readable, {
+    httpMetadata: { contentType: declaredType }
+  });
+
+  // A validation failure aborts the pipe, which aborts the R2 write — R2 only
+  // creates the object on successful completion. Prefer the validation error.
+  const [pipeResult, putResult] = await Promise.allSettled([pipePromise, putPromise]);
+  if (pipeResult.status === 'rejected') throw pipeResult.reason;
+  if (putResult.status === 'rejected') throw putResult.reason;
+
+  return c.json({ url: mediaUrl(filename, declaredType) });
+}
+
 router.post('/', authMiddleware, async (c) => {
   try {
     const contentLength = getContentLength(c);
-    const requestType = (c.req.header('Content-Type') || '').toLowerCase();
-    validateUploadRequest(c, contentLength, requestType);
+    const requestType = normalizeMime(c.req.header('Content-Type'));
+    validateUploadRequest(c, contentLength);
+
+    if (ALLOWED_MIME.has(requestType)) {
+      return await handleRawUpload(c, requestType, contentLength);
+    }
+
+    if (!requestType.includes('multipart/form-data')) {
+      throw new Error('Unsupported file type');
+    }
 
     const { value: formData, response } = await parseFormBody(c, 'Invalid upload payload');
     if (response) return response;
@@ -95,18 +179,17 @@ router.post('/', authMiddleware, async (c) => {
     const filename = `tmp/${crypto.randomUUID()}.${ext}`;
     await c.env.IMG_BUCKET.put(filename, file, { httpMetadata: { contentType: detectedType } });
 
-    const routeBase = detectedType.startsWith('video/') ? 'video' : 'img';
-    const mediaUrl = `/${routeBase}/${filename}`;
+    const url = mediaUrl(filename, detectedType);
 
     if (c.req.header('HX-Request')) {
       const isVideo = detectedType.startsWith('video/');
-      const htmlTag = isVideo 
-        ? `<video src="${mediaUrl}" controls preload="metadata"></video>`
-        : `<img src="${mediaUrl}" loading="lazy" />`;
+      const htmlTag = isVideo
+        ? `<video src="${url}" controls preload="metadata"></video>`
+        : `<img src="${url}" loading="lazy" />`;
       return c.html(htmlTag);
     }
-    
-    return c.json({ url: mediaUrl });
+
+    return c.json({ url });
 
   } catch (err) {
     return jsonError(c, err.message, err.status || 400);

@@ -1,19 +1,82 @@
 import { UI } from './ui.js';
 
-export function authHeaders() {
-    const n = sessionStorage.getItem('session_nonce');
-    return n ? { 'X-Session-Nonce': n } : {};
+// sessionStorage can throw (private mode, storage disabled); fall back to
+// in-memory copies so auth still works for the life of the page.
+let memNonce = null;
+let memToken = null;
+
+export const Nonce = {
+    get() {
+        try { return sessionStorage.getItem('session_nonce') || memNonce; }
+        catch { return memNonce; }
+    },
+    set(val) {
+        memNonce = val;
+        try { sessionStorage.setItem('session_nonce', val); } catch { }
+    },
+    clear() {
+        memNonce = null;
+        try { sessionStorage.removeItem('session_nonce'); } catch { }
+    }
+};
+
+export const Token = {
+    get() {
+        try { return sessionStorage.getItem('session_token') || memToken; }
+        catch { return memToken; }
+    },
+    set(val) {
+        memToken = val;
+        try { sessionStorage.setItem('session_token', val); } catch { }
+    },
+    clear() {
+        memToken = null;
+        try { sessionStorage.removeItem('session_token'); } catch { }
+    }
+};
+
+export function authHeaders(extra = {}) {
+    const headers = { ...extra };
+    const nonce = Nonce.get();
+    if (nonce) headers['X-Session-Nonce'] = nonce;
+    const token = Token.get();
+    if (token) headers['X-Auth-Token'] = token;
+    return headers;
+}
+
+export function clearSession() {
+    Nonce.clear();
+    Token.clear();
+}
+
+// Abort stalled requests so a dead connection surfaces as an error instead of
+// an endless spinner. 60s accommodates slow links; uploads/downloads (which can
+// legitimately run longer) use their own XHR/fetch paths without this signal.
+const REQUEST_TIMEOUT_MS = 60000;
+
+function requestSignal() {
+    return typeof AbortSignal !== 'undefined' && AbortSignal.timeout
+        ? AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+        : undefined;
+}
+
+async function fetchWithTimeout(url, options) {
+    try {
+        return await fetch(url, { ...options, signal: requestSignal() });
+    } catch (e) {
+        if (e?.name === 'TimeoutError' || e?.name === 'AbortError') {
+            const err = new Error('Request timed out. Check your connection.');
+            err.code = 'TIMEOUT';
+            throw err;
+        }
+        throw e;
+    }
 }
 
 export const API = {
-    async checkAuth() {
-        const res = await fetch('/api/auth-status', { headers: authHeaders() });
-        return res.ok;
-    },
-
     async req(endpoint, data = {}, method = 'GET') {
         let url = '/api/' + endpoint;
-        const headers = { ...authHeaders() };
+        const headers = authHeaders();
         let body = undefined;
 
         if (method === 'POST') {
@@ -25,7 +88,7 @@ export const API = {
             if (params.toString()) url += `?${params}`;
         }
 
-        const res = await fetch(url, { method, headers, body });
+        const res = await fetchWithTimeout(url, { method, headers, body, credentials: 'include', cache: 'no-store' });
         const contentType = (res.headers.get('content-type') || '').toLowerCase();
         let payload = null;
 
@@ -37,7 +100,7 @@ export const API = {
         }
 
         if (res.status === 401) {
-            sessionStorage.removeItem('session_nonce');
+            clearSession();
             UI.showAuth();
             const err = new Error(payload?.error || 'Unauthorized');
             err.code = 'UNAUTHORIZED';

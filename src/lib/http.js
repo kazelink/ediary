@@ -11,6 +11,12 @@ export function getContentLength(c) {
   return Number.isFinite(value) ? value : null;
 }
 
+export function getQueryString(c, key, fallback = '') {
+  const value = c.req.query(key);
+  const first = Array.isArray(value) ? value[0] : value;
+  return first == null ? fallback : String(first);
+}
+
 export async function parseJsonBody(c, invalidMessage = 'Invalid JSON payload') {
   try {
     return { value: await c.req.json(), response: null };

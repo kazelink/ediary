@@ -1,5 +1,9 @@
 const DAY_MS = 24 * 60 * 60 * 1000;
-import { extractMediaKeys } from './utils.js';
+const DIARY_PAGE_SIZE = 200;
+// Keep each D1 batch comfortably sized: one page of rows can expand into many
+// media statements, so flush in bounded slices.
+const MEDIA_BATCH_STATEMENTS = 150;
+import { diaryMediaStatements } from './utils.js';
 
 function uploadedAtMs(obj) {
     const ts = obj?.uploaded instanceof Date ? obj.uploaded.getTime() : Date.parse(String(obj?.uploaded || ''));
@@ -45,24 +49,57 @@ function selectBackupKeysToDelete(objects) {
     return backups.slice(MAX_BACKUPS_TO_KEEP).map(b => b.key);
 }
 
+// Iterate all diary rows in bounded pages (keyset pagination on rowid) so a
+// large database never has to fit into isolate memory all at once.
+async function* iterateDiaries(db, columns) {
+    let lastRowId = 0;
+    while (true) {
+        const { results } = await db.prepare(
+            `SELECT rowid, ${columns} FROM diaries WHERE rowid > ? ORDER BY rowid LIMIT ?`
+        ).bind(lastRowId, DIARY_PAGE_SIZE).all();
+
+        const rows = results || [];
+        if (!rows.length) return;
+        lastRowId = rows[rows.length - 1].rowid;
+
+        yield rows;
+        if (rows.length < DIARY_PAGE_SIZE) return;
+    }
+}
+
 // Scheduled backup handler (Cron Trigger)
 export async function scheduledBackup(env) {
     if (!env.DB || !env.IMG_BUCKET) return;
 
     try {
-        // 1) Fetch notes and all cleanup candidates concurrently.
-        const [dbRes, backupObjects, tmpObjects, allMediaObjects] = await Promise.all([
-            env.DB.prepare('SELECT id, date, content FROM diaries').all(),
-            listAllObjects(env.IMG_BUCKET, 'backups/'),
-            listAllObjects(env.IMG_BUCKET, 'tmp/'),
-            listAllObjects(env.IMG_BUCKET, '') // List all for GC
-        ]);
+        // 1) Stream diary rows in pages: build the backup JSON incrementally
+        //    while syncing the diary_media index from the same read.
+        const jsonPieces = [];
+        let count = 0;
 
-        const backupData = JSON.stringify({
-            timestamp: new Date().toISOString(),
-            count: dbRes.results?.length || 0,
-            diaries: dbRes.results || []
-        });
+        for await (const rows of iterateDiaries(env.DB, 'id, date, content')) {
+            let mediaStatements = [];
+            const flushMedia = async () => {
+                if (!mediaStatements.length) return;
+                await env.DB.batch(mediaStatements);
+                mediaStatements = [];
+            };
+            for (const row of rows) {
+                jsonPieces.push(`${count ? ',' : ''}${JSON.stringify({ id: row.id, date: row.date, content: row.content })}`);
+                count += 1;
+                mediaStatements.push(...diaryMediaStatements(env.DB, row.id, row.content));
+                if (mediaStatements.length >= MEDIA_BATCH_STATEMENTS) await flushMedia();
+            }
+            await flushMedia();
+        }
+
+        // Drop index rows for diaries that no longer exist (set-based, one query).
+        await env.DB.prepare(
+            'DELETE FROM diary_media WHERE diary_id NOT IN (SELECT id FROM diaries)'
+        ).run();
+
+        const backupData = `{"timestamp":${JSON.stringify(new Date().toISOString())},"count":${count},"diaries":[${jsonPieces.join('')}]}`;
+        jsonPieces.length = 0;
 
         // 2) Write daily backup file.
         const dateStr = new Date().toISOString().split('T')[0];
@@ -72,6 +109,7 @@ export async function scheduledBackup(env) {
         });
 
         // 3) Retention policy: Keep simple N recent weekly backups.
+        const backupObjects = await listAllObjects(env.IMG_BUCKET, 'backups/');
         const toDelete = selectBackupKeysToDelete(backupObjects);
         if (toDelete.length > 0) {
             console.log(`Backup retention: deleting ${toDelete.length} old backups.`);
@@ -79,6 +117,7 @@ export async function scheduledBackup(env) {
         }
 
         // 4) Delete abandoned tmp uploads older than retention window.
+        const tmpObjects = await listAllObjects(env.IMG_BUCKET, 'tmp/');
         const cutoff = Date.now() - DAY_MS;
         const staleTmp = tmpObjects.filter((obj) => {
             const ts = uploadedAtMs(obj);
@@ -88,16 +127,12 @@ export async function scheduledBackup(env) {
             await Promise.allSettled(staleTmp.map((obj) => env.IMG_BUCKET.delete(obj.key)));
         }
 
-        // 5) Global Media Garbage Collection
-        // Compare all real media files in R2 against all media referenced in the database.
-        const allActiveKeys = new Set();
-        if (dbRes.results) {
-            for (const row of dbRes.results) {
-                const keys = extractMediaKeys(row.content);
-                keys.forEach(k => allActiveKeys.add(k));
-            }
-        }
+        // 5) Global media garbage collection driven by the freshly synced
+        //    diary_media index — no second full-content read required.
+        const { results: usedRows } = await env.DB.prepare('SELECT DISTINCT media_key FROM diary_media').all();
+        const allActiveKeys = new Set((usedRows || []).map(r => r.media_key));
 
+        const allMediaObjects = await listAllObjects(env.IMG_BUCKET, '');
         const toGc = allMediaObjects
             .map(obj => obj.key)
             .filter(key => {

@@ -3,14 +3,16 @@ import { respondError } from './utils.js';
 
 const COOKIE_RE = /(?:^|;\s*)diary_auth=([^;]*)/;
 
-// Full auth requires both the JWT cookie and the session nonce header.
+// Full auth requires the JWT (X-Auth-Token header or cookie) plus the matching session nonce header.
+// The header fallback keeps sessions working when a browser drops or withholds the cookie.
 export async function authMiddleware(c, next) {
     const secret = c.env.JWT_SECRET;
     if (typeof secret !== 'string' || !secret) {
         return respondError(c, 'Server Not Configured', 500);
     }
 
-    const token = parseCookie(c.req.header('Cookie'));
+    const headerToken = c.req.header('X-Auth-Token');
+    const token = (headerToken && headerToken.trim()) || parseCookie(c.req.header('Cookie'));
     const nonce = c.req.header('X-Session-Nonce');
     if (!token || !nonce) {
         return respondError(c, 'Unauthorized', 401);

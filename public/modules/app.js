@@ -1,5 +1,5 @@
 import { Utils, State } from './dom.js';
-import { API, authHeaders } from './api.js';
+import { API, authHeaders, Nonce, Token, clearSession } from './api.js';
 import { UI } from './ui.js';
 import { swalConfirm, swalAlert } from './swal.js';
 import { Editor } from './editor.js';
@@ -26,6 +26,31 @@ function getRestoreInput() {
 function clearRestoreInput() {
     const input = getRestoreInput();
     if (input) input.value = '';
+}
+
+function getDownloadFilename(disposition, fallback) {
+    const utf = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+    if (utf?.[1]) { try { return decodeURIComponent(utf[1]); } catch { } }
+    return disposition.match(/filename="([^"]+)"/i)?.[1] || fallback;
+}
+
+// Stream straight to disk when the browser supports it; large exports never
+// have to fit into a Blob in memory.
+async function saveResponseToFile(res, filename) {
+    if (typeof window.showSaveFilePicker === 'function' && res.body) {
+        const handle = await window.showSaveFilePicker({
+            suggestedName: filename,
+            types: [{ description: 'JSON Backup', accept: { 'application/json': ['.json'] } }]
+        });
+        await res.body.pipeTo(await handle.createWritable());
+        return;
+    }
+    const blobUrl = URL.createObjectURL(await res.blob());
+    const a = document.createElement('a');
+    a.href = blobUrl;
+    a.download = filename;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 0);
 }
 
 function showRestoreMessage(kind, text) {
@@ -111,41 +136,51 @@ const App = {
     _views: {}, _popstateHandler: null, _restoreInFlight: false,
 
     async init() {
-        Auth.init();
-        Editor.init();
+        try {
+            Auth.init();
+            Editor.init();
 
-        // Cache fixed DOM elements
-        this._views = {
-            index: Utils.$('v-index'),
-            list: Utils.$('v-list'),
-            backup: Utils.$('v-backup'),
-            pgData: Utils.$('pg-data')
-        };
+            // Cache fixed DOM elements
+            this._views = {
+                index: Utils.$('v-index'),
+                list: Utils.$('v-list'),
+                backup: Utils.$('v-backup'),
+                pgData: Utils.$('pg-data')
+            };
 
-        // Expose App early so login/inline handlers can call it during async init.
-        window.App = this;
+            // Expose App early so login/inline handlers can call it during async init.
+            window.App = this;
 
-        // Global listener setup
-        this._setupHtmxListeners();
-        UI.initGlobalEvents();
+            // Global listener setup
+            this._setupHtmxListeners();
+            UI.initGlobalEvents();
 
+            const footerYear = Utils.$('footer-year');
+            if (footerYear) footerYear.textContent = String(new Date().getFullYear());
 
-        const footerYear = Utils.$('footer-year');
-        if (footerYear) footerYear.textContent = String(new Date().getFullYear());
+            if (Nonce.get() && Token.get()) {
+                // No dedicated auth-status probe: the first data request doubles as
+                // the auth check, and a 401 lands in the API layer's showAuth()
+                // path. This saves one serial round trip on every cold load.
+                await this.loadView();
+            } else {
+                clearSession();
+                UI.showAuth();
+            }
 
-        const hasNonce = !!sessionStorage.getItem('session_nonce');
-        const authed = hasNonce && await API.checkAuth().catch(() => false);
-        if (authed) {
-            await this.loadView();
-        } else {
-            sessionStorage.removeItem('session_nonce');
-            UI.showAuth();
-        }
-        document.body.classList.add('ready');
-
-        if (!this._popstateHandler) {
-            this._popstateHandler = () => this.loadView();
-            window.addEventListener('popstate', this._popstateHandler);
+            if (!this._popstateHandler) {
+                this._popstateHandler = () => this.loadView();
+                window.addEventListener('popstate', this._popstateHandler);
+            }
+        } catch (e) {
+            console.error('App init failed:', e);
+            try { UI.showAuth(); } catch { }
+            const msg = Utils.$('auth-messages');
+            if (msg) msg.innerHTML = `<div class="auth-err">INIT ERROR: ${String(e?.message || e).replace(/[<>]/g, '')}</div>`;
+        } finally {
+            // Reveal the page even if init blew up — a blank screen is worse
+            // than a degraded one.
+            document.body.classList.add('ready');
         }
     },
 
@@ -278,57 +313,122 @@ const App = {
 
         this._restoreInFlight = true;
         UI.setStatus('loading');
-        showRestoreMessage('info', 'Reading backup...');
 
         try {
             if (file.size > MAX_RESTORE_FILE_BYTES) {
                 throw new Error('Backup file too large (max 100MB).');
             }
 
-            await nextFrame();
-            const rawText = await file.text();
-            if (!rawText) throw new Error('No data provided.');
+            // Preferred path: stream the file to the server in one request; the
+            // backend parses it incrementally. No client-side JSON.parse of a
+            // potentially huge document (which can freeze or crash mobile tabs).
+            let result = await this._restoreViaStream(file);
 
-            showRestoreMessage('info', 'Parsing backup...');
-            await nextFrame();
+            // Fallback: parse and upload in chunks client-side (legacy path).
+            if (!result) result = await this._restoreViaChunks(file);
 
-            let parsed;
-            try {
-                parsed = JSON.parse(rawText);
-            } catch {
-                throw new Error('Invalid JSON.');
-            }
-
-            const entries = extractRestoreEntries(parsed);
-            if (!entries) throw new Error('Invalid data format.');
-
-            const chunks = buildRestoreChunks(entries);
-            let count = 0;
-            let skipped = 0;
-
-            for (let i = 0; i < chunks.length; i += 1) {
-                const percent = Math.round((i / Math.max(chunks.length, 1)) * 100);
-                showRestoreMessage('info', `Restoring backup... ${percent}%`);
-                const result = await API.req('backup/restore', {
-                    entries: chunks[i],
-                    totalBytes: file.size
-                }, 'POST');
-                count += Number(result?.count ?? 0);
-                skipped += Number(result?.skipped ?? 0);
-            }
-
+            const count = Number(result?.count ?? 0);
+            const skipped = Number(result?.skipped ?? 0);
             showRestoreMessage('success', `Restore Successful! Processed ${count} entries, skipped ${skipped} invalid entries.`);
             REFRESH_EVENTS.forEach((name) => dispatchBodyEvent(name));
             dispatchBodyEvent('restoreSuccess', { count, skipped });
         } catch (err) {
-            const message = err?.message || 'Restore failed.';
-            showRestoreMessage('error', `Restore Failed: ${message}`);
+            if (err?.code === 'UNAUTHORIZED') {
+                showRestoreMessage('error', 'Restore Failed: please log in and retry.');
+            } else {
+                const message = err?.message || 'Restore failed.';
+                showRestoreMessage('error', `Restore Failed: ${message}`);
+            }
             UI.setStatus('err');
             resetStatusLater('err');
         } finally {
             clearRestoreInput();
             this._restoreInFlight = false;
         }
+    },
+
+    // Returns the restore result, or null when the server rejected the stream
+    // in a way the chunked path can still handle.
+    async _restoreViaStream(file) {
+        showRestoreMessage('info', 'Uploading backup...');
+        await nextFrame();
+
+        let res;
+        try {
+            res = await fetch('/api/backup/restore', {
+                method: 'POST',
+                headers: authHeaders({
+                    'Content-Type': 'application/json',
+                    'X-Backup-Upload': 'file',
+                    'X-Backup-Size': String(file.size)
+                }),
+                body: file,
+                credentials: 'include',
+                cache: 'no-store'
+            });
+        } catch {
+            return null; // Network-level failure: retry via chunked path.
+        }
+
+        if (res.status === 401) {
+            clearSession();
+            UI.showAuth();
+            const err = new Error('Unauthorized');
+            err.code = 'UNAUTHORIZED';
+            throw err;
+        }
+
+        const payload = (res.headers.get('content-type') || '').toLowerCase().includes('application/json')
+            ? await res.json().catch(() => null)
+            : null;
+
+        if (!res.ok) {
+            // Client-side errors (bad format, too large) will not improve by
+            // re-sending the same data in chunks — surface them directly.
+            if (res.status === 400 || res.status === 413) {
+                throw new Error(payload?.error || 'Restore failed.');
+            }
+            return null;
+        }
+
+        return payload || {};
+    },
+
+    async _restoreViaChunks(file) {
+        showRestoreMessage('info', 'Reading backup...');
+        await nextFrame();
+        const rawText = await file.text();
+        if (!rawText) throw new Error('No data provided.');
+
+        showRestoreMessage('info', 'Parsing backup...');
+        await nextFrame();
+
+        let parsed;
+        try {
+            parsed = JSON.parse(rawText);
+        } catch {
+            throw new Error('Invalid JSON.');
+        }
+
+        const entries = extractRestoreEntries(parsed);
+        if (!entries) throw new Error('Invalid data format.');
+
+        const chunks = buildRestoreChunks(entries);
+        let count = 0;
+        let skipped = 0;
+
+        for (let i = 0; i < chunks.length; i += 1) {
+            const percent = Math.round((i / Math.max(chunks.length, 1)) * 100);
+            showRestoreMessage('info', `Restoring backup... ${percent}%`);
+            const result = await API.req('backup/restore', {
+                entries: chunks[i],
+                totalBytes: file.size
+            }, 'POST');
+            count += Number(result?.count ?? 0);
+            skipped += Number(result?.skipped ?? 0);
+        }
+
+        return { count, skipped };
     },
 
     async downloadBackup() {
@@ -341,19 +441,22 @@ const App = {
             if (to) params.set('to', to);
             const qs = params.toString();
             const url = '/api/backup/export' + (qs ? '?' + qs : '');
-            const headers = authHeaders();
-            const res = await fetch(url, Object.keys(headers).length ? { headers } : {});
+            const res = await fetch(url, { headers: authHeaders(), credentials: 'include', cache: 'no-store' });
+            if (res.status === 401) {
+                clearSession();
+                UI.showAuth();
+                throw new Error('Unauthorized');
+            }
             if (!res.ok) throw new Error('Download failed');
-            const blob = await res.blob();
-            const blobUrl = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = blobUrl;
+
             const range = from || to ? `_${from || 'start'}_${to || 'now'}` : '';
-            a.download = `diary-backup-${new Date().toISOString().slice(0, 10)}${range}.json`;
-            a.click();
-            URL.revokeObjectURL(blobUrl);
+            const fallbackName = `diary-backup-${new Date().toISOString().slice(0, 10)}${range}.json`;
+            await saveResponseToFile(res, getDownloadFilename(res.headers.get('content-disposition') || '', fallbackName));
             UI.setStatus('');
-        } catch {
+        } catch (e) {
+            // Closing the save-file picker is a cancel, not an error.
+            if (e?.name === 'AbortError') { UI.setStatus(''); return; }
+            console.error('Download failed:', e);
             UI.setStatus('err');
         }
     },
@@ -361,8 +464,10 @@ const App = {
     // Internal wiring.
     _setupHtmxListeners() {
         document.addEventListener('htmx:configRequest', (e) => {
-            const sessionNonce = sessionStorage.getItem('session_nonce');
+            const sessionNonce = Nonce.get();
             if (sessionNonce) e.detail.headers['X-Session-Nonce'] = sessionNonce;
+            const token = Token.get();
+            if (token) e.detail.headers['X-Auth-Token'] = token;
 
             const params = new URLSearchParams(location.search);
             if (params.has('year')) e.detail.parameters.year = params.get('year');
@@ -373,6 +478,19 @@ const App = {
         document.addEventListener('htmx:beforeRequest', (e) => {
             if (e.target.id !== 'auth-form') {
                 UI.setStatus('loading');
+            }
+        });
+
+        // The auth check now rides on the first data request: a 401 from any
+        // HTMX-driven load (stats/months/list) re-opens the login overlay.
+        document.addEventListener('htmx:responseError', (e) => {
+            if (e.target?.id === 'auth-form') return;
+            if (e.detail?.xhr?.status === 401) {
+                clearSession();
+                UI.setStatus('');
+                UI.showAuth();
+            } else {
+                UI.setStatus('err');
             }
         });
 
@@ -389,8 +507,10 @@ const App = {
             await this.restoreBackup(file);
         });
 
-        document.addEventListener('htmx:afterOnLoad', () => {
-            UI.setStatus('');
+        document.addEventListener('htmx:afterOnLoad', (e) => {
+            // Error statuses are handled by htmx:responseError; don't let the
+            // generic completion handler wipe the error indicator.
+            if ((e.detail?.xhr?.status || 0) < 400) UI.setStatus('');
 
             // Swaps replace this element, so always re-read it from the DOM.
             const pgData = document.getElementById('pg-data');

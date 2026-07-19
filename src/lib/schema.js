@@ -1,6 +1,9 @@
+import { extractMediaKeys } from './utils.js';
+
 const RETRY_DELAYS_MS = [0, 250, 750, 1500];
-const REQUIRED_TABLES = ['diaries', 'diary_stats'];
+const REQUIRED_TABLES = ['diaries', 'diary_stats', 'diary_media'];
 const REQUIRED_TRIGGERS = ['t_insert_diary', 't_delete_diary', 't_update_diary'];
+const MEDIA_BACKFILL_PAGE_SIZE = 100;
 
 const SCHEMA_STATEMENTS = [
   `
@@ -18,6 +21,14 @@ CREATE TABLE IF NOT EXISTS diary_stats (
   PRIMARY KEY (year, month)
 );
 `.trim(),
+  `
+CREATE TABLE IF NOT EXISTS diary_media (
+  diary_id TEXT NOT NULL,
+  media_key TEXT NOT NULL,
+  PRIMARY KEY (diary_id, media_key)
+);
+`.trim(),
+  'CREATE INDEX IF NOT EXISTS idx_diary_media_media_key ON diary_media(media_key);',
   'CREATE INDEX IF NOT EXISTS idx_diaries_date_rowid ON diaries(date DESC);',
   'CREATE INDEX IF NOT EXISTS idx_diaries_month_expr ON diaries(substr(date, 1, 7));',
   'DROP TRIGGER IF EXISTS t_insert_diary;',
@@ -104,6 +115,37 @@ async function applySchema(db) {
         `Schema statement ${index + 1} failed: ${preview}${sql.length > 160 ? '...' : ''}. ${error?.message || error}`
       );
     }
+  }
+
+  await backfillDiaryMedia(db);
+}
+
+// Backfill: populate diary_media from existing content so index-aware media
+// cleanup sees references created before this table existed. Runs only inside
+// applySchema (i.e. on migration/repair), is idempotent via INSERT OR IGNORE,
+// and paginates by rowid to keep memory bounded on large databases.
+async function backfillDiaryMedia(db) {
+  let lastRowId = 0;
+  while (true) {
+    const { results } = await db.prepare(
+      'SELECT rowid, id, content FROM diaries WHERE rowid > ? ORDER BY rowid LIMIT ?'
+    ).bind(lastRowId, MEDIA_BACKFILL_PAGE_SIZE).all();
+
+    const rows = results || [];
+    if (!rows.length) break;
+    lastRowId = rows[rows.length - 1].rowid;
+
+    const statements = [];
+    for (const row of rows) {
+      for (const key of extractMediaKeys(row.content)) {
+        statements.push(
+          db.prepare('INSERT OR IGNORE INTO diary_media (diary_id, media_key) VALUES (?, ?)').bind(row.id, key)
+        );
+      }
+    }
+    if (statements.length) await db.batch(statements);
+
+    if (rows.length < MEDIA_BACKFILL_PAGE_SIZE) break;
   }
 }
 

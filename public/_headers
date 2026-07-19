@@ -1,0 +1,16 @@
+# Static asset caching for Cloudflare Workers Assets.
+# Vendored assets and fonts never change under the same path — cache immutably.
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
+
+# The stylesheet is version-busted via ?v= query in app.html.
+/app.css
+  Cache-Control: public, max-age=31536000, immutable
+
+# ES module graphs share state by URL; stale cached modules cause hard-to-debug
+# "missing export" failures when any module's shape changes. Always revalidate.
+/modules/*
+  Cache-Control: no-cache
+
+/app.html
+  Cache-Control: no-cache

@@ -1,5 +1,6 @@
 import { UI } from './ui.js';
 import { swalAlert } from './swal.js';
+import { authHeaders, clearSession } from './api.js';
 
 const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
 
@@ -63,14 +64,16 @@ export const Upload = {
             return null;
         }
 
-        const form = new FormData();
-        form.append('file', file);
-
         const xhr = new XMLHttpRequest();
         xhr.open('POST', '/api/upload', true);
-        
-        const authNonce = sessionStorage.getItem('session_nonce');
-        if (authNonce) xhr.setRequestHeader('X-Session-Nonce', authNonce);
+
+        // Raw-body upload: send the file bytes directly with the MIME type as
+        // Content-Type. The server streams them to storage without buffering
+        // the whole file in memory (multipart parsing would).
+        xhr.setRequestHeader('Content-Type', mime);
+        for (const [name, value] of Object.entries(authHeaders())) {
+            xhr.setRequestHeader(name, value);
+        }
 
         const startTime = Date.now();
         
@@ -109,7 +112,7 @@ export const Upload = {
         xhr.onload = () => {
             cleanup();
             if (xhr.status === 401) {
-                sessionStorage.removeItem('session_nonce');
+                clearSession();
                 UI.showAuth();
                 return;
             }
@@ -138,7 +141,7 @@ export const Upload = {
 
         xhr.onabort = cleanup;
 
-        xhr.send(form);
+        xhr.send(file);
         return xhr;
     }
 };

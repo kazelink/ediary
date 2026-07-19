@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { CONFIG } from '../lib/config.js';
 import { signToken } from '../lib/jwt.js';
+import { ensureSchema } from '../lib/schema.js';
 import { respondError } from '../lib/utils.js';
 
 const router = new Hono();
@@ -50,17 +51,28 @@ async function timingSafeEqual(a, b) {
   return result === 0;
 }
 
+function lockedResponse(c, lockedUntil, now) {
+  const waitSec = Math.ceil((lockedUntil - now) / 1000);
+  c.header('Retry-After', String(waitSec));
+  return respondError(c, `Locked. Retry in ${waitSec}s`, 429);
+}
+
+function isHttpsRequest(c) {
+  const forwardedProto = (c.req.header('x-forwarded-proto') || '').split(',')[0].trim().toLowerCase();
+  if (forwardedProto) return forwardedProto === 'https';
+  try { return new URL(c.req.url).protocol === 'https:'; } catch { return true; }
+}
+
 router.post('/', async (c) => {
   const ip = c.req.header('CF-Connecting-IP')
+    || c.req.header('X-Real-IP')
     || c.req.header('X-Forwarded-For')?.split(',')[0]?.trim()
     || 'unknown';
   const now = Date.now();
 
   const record = getLimit(ip);
   if (record && record.lockedUntil > now) {
-    const waitSec = Math.ceil((record.lockedUntil - now) / 1000);
-    c.header('Retry-After', String(waitSec));
-    return respondError(c, `Locked. Retry in ${waitSec}s`, 429);
+    return lockedResponse(c, record.lockedUntil, now);
   }
 
   let body = {};
@@ -82,9 +94,7 @@ router.post('/', async (c) => {
   if (!(await timingSafeEqual(body.password, c.env.APP_PASSWORD))) {
     const lockedUntil = recordFail(ip, now);
     if (lockedUntil > now) {
-      const waitSec = Math.ceil((lockedUntil - now) / 1000);
-      c.header('Retry-After', String(waitSec));
-      return respondError(c, `Locked. Retry in ${waitSec}s`, 429);
+      return lockedResponse(c, lockedUntil, now);
     }
     return respondError(c, 'Wrong Password', 401);
   }
@@ -97,20 +107,30 @@ router.post('/', async (c) => {
     const nonce = [...nonceBytes].map(b => b.toString(16).padStart(2, '0')).join('');
 
     const token = await signToken(c.env.JWT_SECRET, nonce);
+
+    // Warm the schema in the background so the first data request after login
+    // does not pay the initialization cost.
+    c.executionCtx.waitUntil(
+      ensureSchema(c.env).catch(err => console.error('ensureSchema error after login:', err))
+    );
+
     const cookieOpts = [
       `diary_auth=${token}`,
       'HttpOnly',
-      'Secure',
-      'SameSite=Strict',
+      ...(isHttpsRequest(c) ? ['Secure'] : []),
+      'SameSite=Lax',
+      `Max-Age=${CONFIG.JWT_EXP}`,
       'Path=/'
     ].join('; ');
     c.header('Set-Cookie', cookieOpts);
 
     if (c.req.header('HX-Request')) {
-      c.header('HX-Trigger', JSON.stringify({ loginSuccess: { nonce } }));
-      return c.html('<div class="auth-ok"></div>');
+      // Nonce and JWT travel as data-* attributes on the swapped element; the
+      // trigger fires after swap so the frontend reads them from the DOM.
+      c.header('HX-Trigger-After-Swap', JSON.stringify({ loginSuccess: {} }));
+      return c.html(`<div class="auth-ok" data-nonce="${nonce}" data-token="${token}"></div>`);
     }
-    return c.json({ success: true, nonce });
+    return c.json({ success: true, nonce, token });
   } catch {
     return respondError(c, 'Crypto Error', 500);
   }
